@@ -6,6 +6,7 @@ Extension points:
 - Add provider-specific defaults and validation.
 """
 
+import httpx
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
 from app.llm_provider.models import LLMProviderConfig
@@ -19,6 +20,16 @@ class LLMFactory:
     - Add caching to reuse clients across flows.
     - Add structured tracing hooks for request/response metadata.
     """
+
+    def __init__(self, ssl_verify: bool = True) -> None:
+        """
+        Initialize the factory with HTTP client configuration.
+
+        Extension points:
+        - Add proxy or custom transport configuration.
+        """
+
+        self._http_client = httpx.Client(verify=ssl_verify)
 
     def build_chat_model(self, config: LLMProviderConfig):
         """
@@ -45,6 +56,7 @@ class LLMFactory:
             "model": config.model,
             "api_key": config.api_key,
             "base_url": config.base_url,
+            "http_client": self._http_client,
         }
         if config.temperature is not None:
             params["temperature"] = config.temperature
@@ -65,6 +77,7 @@ class LLMFactory:
             "azure_endpoint": config.azure_endpoint,
             "api_version": config.azure_api_version,
             "deployment_name": config.azure_deployment_name,
+            "http_client": self._http_client,
         }
         if config.temperature is not None:
             params["temperature"] = config.temperature

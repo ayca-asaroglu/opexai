@@ -63,7 +63,7 @@ class AppContainer:
         """
 
         if self._llm_factory is None:
-            self._llm_factory = LLMFactory()
+            self._llm_factory = LLMFactory(ssl_verify=self._settings.ssl_verify)
         return self._llm_factory
 
     def function_registry(self) -> FunctionRegistry:
