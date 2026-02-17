@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     app_name: str = "LLM Orchestration Platform"
     environment: str = "dev"
     ssl_verify: bool = True
+    llm_max_tokens: int | None = None
     default_provider: str = "openai"
     default_openai_model: str = "gpt-4o"
     default_local_model: str = "llama3"

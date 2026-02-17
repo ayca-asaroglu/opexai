@@ -91,6 +91,7 @@ class OrchestrationService:
                 azure_endpoint=self._settings.azure_endpoint,
                 azure_api_version=self._settings.azure_api_version,
                 azure_deployment_name=self._settings.azure_deployment_name,
+                max_tokens=self._settings.llm_max_tokens,
             )
         if provider == "local":
             return LLMProviderConfig(
@@ -98,12 +99,14 @@ class OrchestrationService:
                 model=self._settings.default_local_model,
                 base_url=self._settings.local_base_url,
                 api_key=self._settings.local_api_key,
+                max_tokens=self._settings.llm_max_tokens,
             )
         return LLMProviderConfig(
             provider="openai",
             model=self._settings.default_openai_model,
             base_url=self._settings.openai_base_url,
             api_key=self._settings.openai_api_key or "",
+            max_tokens=self._settings.llm_max_tokens,
         )
 
     def _get_graph(self):
