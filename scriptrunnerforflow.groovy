@@ -294,11 +294,15 @@ class PipelineState {
 //
 // REQUEST:
 // {
-//   "question": "Kullanıcının son mesajı",
+//   "question":    "Kullanıcının son mesajı",
+//   "thread_id":   "conv-abc123",   // opsiyonel; echo olarak dönülür
 //   "chat_history": [
 //     {
 //       "inputs":  { "question": "önceki kullanıcı mesajı" },
-//       "outputs": { "llm_output": "önceki asistan cevabı" }
+//       "outputs": {
+//         "llm_output": "önceki asistan cevabı"
+//         // veya llm_output: { content: "...", role: "assistant", ... }
+//       }
 //     }
 //   ]
 // }
@@ -306,9 +310,10 @@ class PipelineState {
 // RESPONSE:
 // {
 //   "answer":     "Kullanıcıya gösterilecek metin",
-//   "complexity": "M",       // null | "XS" | "S" | "M" | "L"
-//   "isDone":     true,      // submit_idea_form tamamlandıysa true
-//   "args": {                // isDone=true ise dolu, aksi hâlde null
+//   "thread_id":  "conv-abc123",    // request'teki thread_id echo edilir
+//   "complexity": "M",              // null | "XS" | "S" | "M" | "L"
+//   "isDone":     true,             // submit_idea_form tamamlandıysa true
+//   "args": {                       // isDone=true ise dolu, aksi hâlde null
 //     "fikrin_ozeti": "...",
 //     "fikrin_aciklamasi": "...",
 //     "amac": "...",
@@ -319,7 +324,7 @@ class PipelineState {
 //     "hedef_kitle": "...",
 //     "kpi": "..."
 //   },
-//   "trace": []              // ileride kullanım için rezerve
+//   "trace": []
 // }
 // ============================================================
 
@@ -351,8 +356,12 @@ Response opexaiFlow(String body) {
     // Son assistant mesajını bul
     String answer = state.messages.reverse().find { it.role == "assistant" }?.content ?: ""
 
+    // thread_id: geldiyse echo et, yoksa null
+    String threadId = request.thread_id?.toString() ?: null
+
     Map responsePayload = [
         answer    : answer,
+        thread_id : threadId,
         complexity: state.t_shirt_size,
         isDone    : state.form_submitted,
         args      : state.idea_form,
@@ -367,6 +376,10 @@ Response opexaiFlow(String body) {
 // ============================================================
 // STATE BUILDER
 // chat_history → messages listesine, yeni question → sona eklenir
+//
+// llm_output hem string hem obje gelebilir:
+//   "llm_output": "cevap metni"
+//   "llm_output": { "content": "cevap metni", "role": "assistant", ... }
 // ============================================================
 
 PipelineState buildInitialState(Map request) {
@@ -377,8 +390,17 @@ PipelineState buildInitialState(Map request) {
 
     chatHistory.each { item ->
         if (!(item instanceof Map)) return
-        String prevQ = item?.inputs?.question?.toString()?.trim()   ?: ""
-        String prevA = item?.outputs?.llm_output?.toString()?.trim() ?: ""
+        String prevQ = item?.inputs?.question?.toString()?.trim() ?: ""
+
+        // llm_output string veya { content: "..." } objesi olabilir
+        def   rawOutput = item?.outputs?.llm_output
+        String prevA = ""
+        if (rawOutput instanceof String) {
+            prevA = rawOutput.trim()
+        } else if (rawOutput instanceof Map) {
+            prevA = (rawOutput?.content ?: "").toString().trim()
+        }
+
         if (prevQ) state.messages << [role: "user",      content: prevQ]
         if (prevA) state.messages << [role: "assistant", content: prevA]
     }
