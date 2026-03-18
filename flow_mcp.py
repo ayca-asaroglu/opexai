@@ -354,6 +354,26 @@ def _tools_for_step(step: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _default_question_for_step(step: str) -> str:
+    """
+    Bazı modeller tool_call yapıp content boş dönebilir.
+    Bu durumda kullanıcıya gösterilecek fallback soruyu üretir.
+    """
+    prompts = {
+        "problem": "Bu fikir ile hangi problemi çözmeyi hedefliyorsunuz? (Kısaca problemi anlatır mısınız?)",
+        "mevcut_durum": "Şu an bu ihtiyaç nasıl karşılanıyor? (Mevcut süreç/çözüm var mı?)",
+        "fikrin_ozeti": "Fikrinizin kısa ve net adı nedir?",
+        "amac": "Bu fikir hangi amaca hizmet ediyor? (Listeden birini seçebilir misiniz?)",
+        "fikrin_aciklamasi": "Fikrin detaylı açıklamasını paylaşır mısınız? (Kapsamı ve beklenen sonucu dahil)",
+        "cozum_tipi": "Kabaca nasıl bir çözüm yapılmasını istiyorsunuz? (Örn: yeni ekran, otomasyon, entegrasyon)",
+        "kanallar": "Bu geliştirme hangi kanallarda kullanılacak? (Birden fazla seçebilirsiniz)",
+        "hedef_kitle": "Bu çözümün hedef kitlesi kimler?",
+        "kpi": "Bu fikir ile hangi metriklerde fark yaratmayı hedefliyorsunuz? (Yoksa 'yok' diyebilirsiniz)",
+        "confirm": "Toplanan bilgileri özetleyip onayınızı alacağım. Onaylıyor musunuz? (Evet/Hayır)",
+    }
+    return prompts.get(step, "Devam edebilmem için biraz daha detay paylaşır mısınız?")
+
+
 def _build_step_system_prompt(current_step: str, fields: Dict[str, Any]) -> str:
     step_prompt = STEP_PROMPTS.get(current_step, STEP_PROMPTS[STEP_ORDER[0]])
     fields_summary = _summarize_fields(fields)
@@ -449,45 +469,63 @@ def flow_analyst_step_core(
     extracted: Dict[str, Any] = {}
     is_confirmed = False
 
-    if tools:
-        llm_raw = _call_llm_tools(system_prompt, msgs, tools)
-        assistant_message, tool_calls = _extract_assistant_message_and_tool_calls(llm_raw)
+    def run_llm_for_step(step: str) -> tuple[str, Dict[str, Any], bool]:
+        sp = _build_step_system_prompt(current_step=step, fields=fields)
+        t = _tools_for_step(step)
 
-        for tc in tool_calls:
-            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-            name = fn.get("name")
-            args = _safe_json_loads(fn.get("arguments"))
+        if t:
+            raw = _call_llm_tools(sp, msgs, t)
+            content, tool_calls = _extract_assistant_message_and_tool_calls(raw)
 
-            if name == "set_text_field":
-                val = (args.get("value") or "").strip() if isinstance(args, dict) else ""
-                if val:
-                    extracted[current_step] = val
+            local_extracted: Dict[str, Any] = {}
+            local_confirmed = False
 
-            elif name == "set_kanallar":
-                chans = args.get("kanallar") if isinstance(args, dict) else None
-                if isinstance(chans, list):
-                    extracted["kanallar"] = [c for c in chans if isinstance(c, str) and c.strip()]
+            for tc in tool_calls:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                name = fn.get("name")
+                args = _safe_json_loads(fn.get("arguments"))
 
-            elif name == "set_amac":
-                amac_val = args.get("amac") if isinstance(args, dict) else None
-                if isinstance(amac_val, str) and amac_val.strip():
-                    extracted["amac"] = amac_val.strip()
+                if name == "set_text_field":
+                    val = (args.get("value") or "").strip() if isinstance(args, dict) else ""
+                    if val:
+                        local_extracted[step] = val
 
-            elif name == "confirm_form":
-                is_confirmed = bool(args.get("is_confirmed")) if isinstance(args, dict) else False
+                elif name == "set_kanallar":
+                    chans = args.get("kanallar") if isinstance(args, dict) else None
+                    if isinstance(chans, list):
+                        local_extracted["kanallar"] = [
+                            c for c in chans if isinstance(c, str) and c.strip()
+                        ]
 
-        # Tool call gelmediyse fallback: JSON-mode ile dene
-        if not extracted and not is_confirmed and not assistant_message:
-            result = _call_llm_json(system_prompt, msgs)
-            assistant_message = (result.get("assistant_message") or "").strip()
-            extracted = result.get("extracted") or {}
-            is_confirmed = bool(result.get("is_confirmed"))
-    else:
+                elif name == "set_amac":
+                    amac_val = args.get("amac") if isinstance(args, dict) else None
+                    if isinstance(amac_val, str) and amac_val.strip():
+                        local_extracted["amac"] = amac_val.strip()
+
+                elif name == "confirm_form":
+                    local_confirmed = (
+                        bool(args.get("is_confirmed")) if isinstance(args, dict) else False
+                    )
+
+            # Tool call gelmediyse fallback: JSON-mode ile dene (tek sefer)
+            if not local_extracted and not local_confirmed and not content:
+                j = _call_llm_json(sp, msgs)
+                content = (j.get("assistant_message") or "").strip()
+                local_extracted = j.get("extracted") or {}
+                local_confirmed = bool(j.get("is_confirmed"))
+
+            return content, local_extracted, local_confirmed
+
         # Safety fallback (normalde STEP_ORDER hepsi tool'a sahip)
-        result = _call_llm_json(system_prompt, msgs)
-        assistant_message = (result.get("assistant_message") or "").strip()
-        extracted = result.get("extracted") or {}
-        is_confirmed = bool(result.get("is_confirmed"))
+        j = _call_llm_json(sp, msgs)
+        return (
+            (j.get("assistant_message") or "").strip(),
+            j.get("extracted") or {},
+            bool(j.get("is_confirmed")),
+        )
+
+    # 1) Önce current_step için LLM çalıştır
+    assistant_message, extracted, is_confirmed = run_llm_for_step(current_step)
 
     _merge_extracted(fields, extracted)
 
@@ -507,6 +545,26 @@ def flow_analyst_step_core(
             field_is_filled = bool(v) and (not isinstance(v, str) or bool(v.strip()))
 
         state["current_step"] = _next_step_name(current_step) if field_is_filled else current_step
+
+    # Bazı modeller tool_call sonrası content boş dönebilir.
+    # Bu durumda aynı turda bir sonraki step için 1 kez daha LLM çağırıp soruyu üret.
+    if not assistant_message and not state.get("is_confirmed"):
+        next_step_for_user = state.get("current_step") or current_step
+        if next_step_for_user != "done" and next_step_for_user != current_step:
+            assistant_message, extracted2, is_confirmed2 = run_llm_for_step(next_step_for_user)
+            _merge_extracted(fields, extracted2)
+            if is_confirmed2:
+                state["is_confirmed"] = True
+                state["current_step"] = "done"
+
+    # Hâlâ boşsa fallback metin bas
+    if not assistant_message:
+        step_for_user = state.get("current_step") or current_step
+        assistant_message = (
+            "Teşekkürler. Form onaylandı."
+            if step_for_user == "done"
+            else _default_question_for_step(step_for_user)
+        )
 
     # history güncelle (user+assistant)
     if question:
