@@ -9,7 +9,9 @@ fastmcp tabanlı tek dosya:
 
 from __future__ import annotations
 
+import json
 import os
+import uuid
 from typing import List, Dict, Any, Optional
 
 import requests
@@ -20,108 +22,214 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "dummy")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
 
+# ============================================================
+# STEP-BASED ANALYST (kısa prompt + memory cache)
+# ============================================================
 
-ANALYST_SYSTEM_PROMPT = """
-Kullanıcılardan fikir, ihtiyaç ve gereksinimleri sistematik, analitik ve yönlendirici bir yaklaşımla toplayan bir analist asistansın.
+AMAC_ENUM = [
+    "Özel bankacılıkta karlı büyüme",
+    "Ticari bankacılıkta karlı büyüme",
+    "Tüzel mobilde işbirlikleri yoluyla kazanımın artması ve müşteri aktifliğini artıracak yeni ürünlerin hayata geçmesi",
+    "Şubelerin hızını ve satış potansiyelini artıracak veriye dayalı operasyonel karar süreçlerinin otomatik hale getirilmesi",
+    "Operasyonel verimlilik için manuel olan süreçlerin teknoloji ile yeniden tasarlanması",
+    "Regülatif /Yasal",
+    "Müşteri Deneyimini İyileştirme/Memnuniyetini Artırmak",
+]
 
-Bir analist gibi davranırsın:
-- Kullanıcının verdiği cevapları yüzeysel olarak kabul etmezsin.
-- Gerektiğinde derinleştirir, açıklama ister, örneklerle yönlendirirsin.
-- Kullanıcının cevabı muğlak, eksik, genel veya belirsizse bunu nazikçe belirtir ve detay isteyerek netleştirirsin.
-- Asıl hedefin: Kullanıcıyı yormadan ama derinleştirerek, yüksek kaliteli bir fikir formu oluşturmaktır.
+KANAL_ENUM = [
+    "Çağrı Merkezi",
+    "İnternet Bankacılığı",
+    "Mobil Bankacılık",
+    "Şube",
+    "ATM",
+    "Web",
+    "Video Bankacılık",
+    "IVR",
+    "Servis Bankacılığı",
+]
 
-GENEL DAVRANIŞ KURALLARI:
-- Her adımda yalnızca bir soru sor.
-- Empatik, sade ve açıklayıcı bir üslup kullan.
-- Cevabı sadece almakla yetinme; analiz et, gerekirse netlik sor.
-- Her sorudan sonra kısa bir örnek ver; mümkünse en az 2 farklı senaryo örneği sun.
-- Cevapta başka alanlara ait bilgiler varsa bunları otomatik olarak ilgili alana yerleştir ve o soruyu tekrar sorma.
-- Kullanıcı cevaplarını düzenli, profesyonel ve anlaşılır cümlelere dönüştür.
-- Kullanıcıdan gelen her cevaba karşılık en az 3-4 cümlelik açıklayıcı bir yanıt üret; tek satırlık cevaplar verme.
-- Kullanıcı "fikrim yok", "vazgeçtim" vb. gibi süreci durdurursa süreci kibarca bitir ve function_call üretme.
-- Süreç boyunca kullanıcıya cevap verirken JSON veya function_call kullanma; sadece doğal metinle konuş.
-- Tüm alanlar dolunca önce profesyonel bir özet göster, ardından onay iste.
-- Onay gelirse function_call üret.
+STEP_ORDER: List[str] = [
+    "problem",
+    "mevcut_durum",
+    "fikrin_ozeti",
+    "amac",
+    "fikrin_aciklamasi",
+    "cozum_tipi",
+    "kanallar",
+    "hedef_kitle",
+    "kpi",
+    "confirm",
+]
 
-TOPLANACAK ALANLAR (8Fikir Girişi ile uyumlu):
+STEP_PROMPTS: Dict[str, str] = {
+    "problem": 'problem alanını doldur: "Bu fikir ile hangi problemi çözmeyi hedefliyorsunuz?"',
+    "mevcut_durum": 'mevcut_durum alanını doldur: "Şu an bu ihtiyaç nasıl karşılanıyor?"',
+    "fikrin_ozeti": 'fikrin_ozeti alanını doldur: "Fikrin kısa ve net adı nedir?"',
+    "amac": (
+        'amac alanını doldur: "Bu fikir hangi amaca hizmet ediyor?" '
+        "Sadece şu seçeneklerden birini seç: " + " | ".join(AMAC_ENUM)
+    ),
+    "fikrin_aciklamasi": 'fikrin_aciklamasi alanını doldur: "Fikrin detaylı açıklaması nedir?"',
+    "cozum_tipi": 'cozum_tipi alanını doldur: "Kabaca nasıl bir çözüm yapılmasını istiyorsunuz?"',
+    "kanallar": (
+        'kanallar alanını doldur: "Bu geliştirme hangi kanallarda kullanılacak?" '
+        "Uygun kanalları seç ve dizi döndür. Olası değerler: " + " | ".join(KANAL_ENUM)
+    ),
+    "hedef_kitle": 'hedef_kitle alanını doldur: "Bu çözümün hedef kitlesi kimler?"',
+    "kpi": 'kpi opsiyonel: "Bu fikir ile hangi metriklerde fark yaratmayı hedefliyorsun?" (yoksa null bırak)',
+    "confirm": (
+        "Tüm alanlar doluysa kurumsal bir özet oluştur ve kullanıcıdan onay iste. "
+        "Kullanıcı onay verirse is_confirmed=true döndür."
+    ),
+}
 
-1. problem → "Bu fikir ile hangi problemi çözmeyi hedefliyorsunuz?"
-   - Kullanıcıdan net bir problem cümlesi iste.
-   - Çok genel ise neden sorun olduğu, nerede ortaya çıktığı, kimleri etkilediği gibi detayları sor.
-
-2. mevcut_durum → "Şu an bu ihtiyaç nasıl karşılanıyor?"
-   - Varsa mevcut süreç, workaround, manuel çözüm veya hiç çözülmüyor durumu sor.
-
-3. fikrin_ozeti → "Adı" — Fikrin kısa ve net adı.
-
-4. amac → "Bu fikir hangi amaca hizmet ediyor?"
-   Seçenekler (bunlar dışında seçenek üretme):
-   - Özel bankacılıkta karlı büyüme
-   - Ticari bankacılıkta karlı büyüme
-   - Tüzel mobilde işbirlikleri yoluyla kazanımın artması ve müşteri aktifliğini artıracak yeni ürünlerin hayata geçmesi
-   - Şubelerin hızını ve satış potansiyelini artıracak veriye dayalı operasyonel karar süreçlerinin otomatik hale getirilmesi
-   - Operasyonel verimlilik için manuel olan süreçlerin teknoloji ile yeniden tasarlanması
-   - Regülatif /Yasal
-   - Müşteri Deneyimini İyileştirme/Memnuniyetini Artırmak
-
-5. fikrin_aciklamasi → "Açıklaması" — Fikrin detaylı açıklaması (free text).
-
-6. cozum_tipi → "Kabaca nasıl bir çözüm yapılmasını istiyorsunuz?"
-   - Örnekler: yeni ekran, süreç sadeleştirme, otomasyon, entegrasyon vb.
-
-7. kanallar → "Bu geliştirme hangi kanallarda kullanılacak?" (Seçimli)
-   Eşleştirme kuralları:
-   - "mobil", "app", "telefon uygulaması" → Mobil Bankacılık
-   - "internet bankacılığı", "IB", "online" → İnternet Bankacılığı
-   - "web", "site", "tarayıcı" → Web
-   - "çağrı merkezi", "müşteri hizmetleri" → Çağrı Merkezi
-   - "şube", "bankaya gidince" → Şube
-   - "ATM", "kart takınca" → ATM
-   - "IVR", "sesli yanıt" → IVR
-   - "video görüşme" → Video Bankacılık
-   - "servis", "entegrasyon" → Servis Bankacılığı
-
-8. hedef_kitle → "Bu çözümün hedef kitlesi kimler?"
-   Örnekler: Bireysel müşteriler, KOBİ ve ticari işletmeler, Kurumsal firmalar,
-   Tarımsal işletmeler, Özel bankacılık müşterileri, Dijital bankacılık kullanıcıları, Diğer
-
-9. kpi (opsiyonel) → "Bu fikir ile hangi metriklerde fark yaratmayı hedefliyorsun?"
-   Örnekler: işlem süresi, müşteri memnuniyeti, maliyet azaltma, dönüşüm oranı, hata oranı
-
-SORU SORMA STRATEJİSİ:
-- Tek satırlık, muğlak cevaplarda nazikçe daha fazla detay iste.
-- Her alanı işlerken analist gibi düşün: tutarsızlık, eksiklik, belirsizlik varsa sor.
-- Kullanıcıyı boğmadan ama cevabın gerçekten işe yarar olmasını sağlayacak şekilde derinleştir.
-
-UZUNLUK ve ÖZET KURALLARI:
-- Normal cevaplarda en az 3-4 cümle kullan; kullanıcıyı yönlendirecek kadar detay ver.
-- Özet oluştururken her alan için en az 1-2 cümlelik açıklama üret; toplamda 5-7 maddelik zengin bir özet sun.
-
-TÜM ALANLAR TAMAMLANDIĞINDA:
-- Profesyonel ve düzenli bir özet oluştur. Her alanı başlıklandır, kurumsal bir dille sun.
-- Ardından şunu sor: "Onaylıyorsanız 'Evet' yazabilirsiniz, değişiklik yapmak istiyorsanız hangi alanı güncellemek istediğinizi belirtin."
-- Kullanıcı "Evet" derse, hiçbir normal metin yazmadan, şu alanların tümünü içeren bir function_call üret:
-  fikrin_ozeti, fikrin_aciklamasi, amac, problem, cozum_tipi, kanallar, mevcut_durum, hedef_kitle, kpi
-- Kullanıcı bir alanı güncellemek isterse sadece o alanı tekrar sor. Sonra tekrar özet göster ve onay iste.
-"""
+_STATE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _call_llm(system_prompt: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+def _new_state() -> Dict[str, Any]:
+    return {
+        "current_step": STEP_ORDER[0],
+        "fields": {
+            "problem": None,
+            "mevcut_durum": None,
+            "fikrin_ozeti": None,
+            "amac": None,
+            "fikrin_aciklamasi": None,
+            "cozum_tipi": None,
+            "kanallar": [],
+            "hedef_kitle": None,
+            "kpi": None,
+        },
+        "is_confirmed": False,
+        "history": [],  # [{role, content}] kısa chat context
+    }
+
+
+def _summarize_fields(fields: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for k in [
+        "problem",
+        "mevcut_durum",
+        "fikrin_ozeti",
+        "amac",
+        "fikrin_aciklamasi",
+        "cozum_tipi",
+        "kanallar",
+        "hedef_kitle",
+        "kpi",
+    ]:
+        v = fields.get(k)
+        if v is None:
+            continue
+        if isinstance(v, list) and not v:
+            continue
+        lines.append(f"- {k}: {v}")
+    return "\n".join(lines) if lines else "(henüz alan dolmadı)"
+
+
+def _next_step_name(current_step: str) -> str:
+    try:
+        idx = STEP_ORDER.index(current_step)
+    except ValueError:
+        return STEP_ORDER[0]
+    return STEP_ORDER[min(idx + 1, len(STEP_ORDER) - 1)]
+
+
+def _merge_extracted(fields: Dict[str, Any], extracted: Dict[str, Any]) -> None:
+    if not isinstance(extracted, dict):
+        return
+    for k, v in extracted.items():
+        if k not in fields:
+            continue
+        if k == "kanallar":
+            if isinstance(v, list):
+                cleaned = [x for x in v if isinstance(x, str) and x.strip()]
+                fields["kanallar"] = cleaned
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        fields[k] = v
+
+
+def _parse_json_from_llm(text: str) -> Dict[str, Any]:
     """
-    Verilen system_prompt + messages listesini alıp
-    LLM_BASE_URL altındaki OpenAI-compatible /chat/completions
-    endpoint'ine istek atar ve JSON cevabı döner.
+    JSON mode destekli backendlerde doğrudan JSON gelir.
+    Yine de olası fence/backtick durumları için toleranslı parse eder.
+    """
+    t = (text or "").strip()
+    if not t:
+        return {}
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t.replace("json", "", 1).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        # Son çare: JSON objesi gibi görünen kısmı yakalamaya çalış
+        start = t.find("{")
+        end = t.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(t[start : end + 1])
+            except Exception:
+                return {}
+        return {}
+
+
+def _call_llm_json(system_prompt: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    JSON output bekleyen chat/completions çağrısı.
+    OpenAI-style response_format destekliyse kullanır.
     """
     openai_messages: List[Dict[str, str]] = []
     if system_prompt:
         openai_messages.append({"role": "system", "content": system_prompt})
     openai_messages.extend(messages)
 
-    body = {
+    body: Dict[str, Any] = {
         "model": LLM_MODEL,
-        "max_tokens": 4096,
+        "max_tokens": 2048,
         "temperature": 0,
         "messages": openai_messages,
+        "response_format": {"type": "json_object"},
+    }
+
+    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Bearer {LLM_API_KEY}",
+    }
+
+    resp = requests.post(url, headers=headers, json=body, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    return _parse_json_from_llm(content)
+
+
+def _call_llm_tools(
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    tools: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Tool-calling destekli chat/completions çağrısı.
+    Dönen assistant message + tool_calls bilgisini olduğu gibi döndürür.
+    """
+    openai_messages: List[Dict[str, str]] = []
+    if system_prompt:
+        openai_messages.append({"role": "system", "content": system_prompt})
+    openai_messages.extend(messages)
+
+    body: Dict[str, Any] = {
+        "model": LLM_MODEL,
+        "max_tokens": 1200,
+        "temperature": 0,
+        "messages": openai_messages,
+        "tools": tools,
+        "tool_choice": "auto",
     }
 
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
@@ -135,94 +243,139 @@ def _call_llm(system_prompt: str, messages: List[Dict[str, str]]) -> Dict[str, A
     return resp.json()
 
 
-def _extract_text(llm_response: Dict[str, Any]) -> str:
-    """
-    LLM cevabından choices[0].message.content alanını çıkarıp
-    sade metin olarak döner. choices yoksa boş string döner.
-    """
+def _extract_assistant_message_and_tool_calls(
+    llm_response: Dict[str, Any],
+) -> tuple[str, List[Dict[str, Any]]]:
     choices = llm_response.get("choices") or []
     if not choices:
-        return ""
-    return (choices[0].get("message", {}).get("content") or "").strip()
+        return "", []
+    msg = (choices[0].get("message") or {}) if isinstance(choices[0], dict) else {}
+    content = (msg.get("content") or "").strip()
+    tool_calls = msg.get("tool_calls") or []
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    return content, tool_calls
 
 
-def _build_messages(
-    question: str,
-    chat_history: Optional[List[Dict[str, Any]]],
-) -> List[Dict[str, str]]:
+def _safe_json_loads(s: Any) -> Dict[str, Any]:
+    if not isinstance(s, str):
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+
+def _tools_for_step(step: str) -> List[Dict[str, Any]]:
     """
-    flow.groovy ile uyumlu olacak şekilde:
-    - chat_history içindeki önceki soru/cevapları
-      user/assistant mesajlarına çevirir,
-    - en sona güncel question'ı user mesajı olarak ekler.
-    LLM'e gönderilecek messages dizisini üretir.
+    Her adımda sadece ilgili alanı yazdıracak tool verilir.
     """
-    msgs: List[Dict[str, str]] = []
+    if step == "kanallar":
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_kanallar",
+                    "description": "Kanallar alanını doldurur/günceller.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "kanallar": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": KANAL_ENUM},
+                            }
+                        },
+                        "required": ["kanallar"],
+                    },
+                },
+            }
+        ]
 
-    for item in chat_history or []:
-        if not isinstance(item, dict):
-            continue
-        prev_q = (item.get("inputs", {}).get("question") or "").strip()
-        raw_out = item.get("outputs", {}).get("llm_output")
-        if isinstance(raw_out, dict):
-            prev_a = (raw_out.get("content") or "").strip()
-        else:
-            prev_a = (raw_out or "").strip()
+    if step == "amac":
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_amac",
+                    "description": "Amac alanını doldurur/günceller.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"amac": {"type": "string", "enum": AMAC_ENUM}},
+                        "required": ["amac"],
+                    },
+                },
+            }
+        ]
 
-        if prev_q:
-            msgs.append({"role": "user", "content": prev_q})
-        if prev_a:
-            msgs.append({"role": "assistant", "content": prev_a})
+    if step == "confirm":
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "confirm_form",
+                    "description": "Kullanıcının form onayını işaretler.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"is_confirmed": {"type": "boolean"}},
+                        "required": ["is_confirmed"],
+                    },
+                },
+            }
+        ]
 
-    if question:
-        msgs.append({"role": "user", "content": question})
-
-    return msgs
-
-
-def flow_analyst_core(
-    question: str,
-    thread_id: Optional[str] = None,
-    chat_history: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """
-    İş mantığı:
-    - chat_history + question'dan messages dizisini kurar,
-    - LLM'i ANALYST_SYSTEM_PROMPT ile çağırır,
-    - cevap metnini çıkarır ve
-      {"answer": ..., "thread_id": ...} sözlüğü döner.
-    """
-    msgs = _build_messages(question, chat_history or [])
-    llm_resp = _call_llm(ANALYST_SYSTEM_PROMPT, msgs)
-    answer = _extract_text(llm_resp)
-    return {
-        "answer": answer,
-        "thread_id": thread_id,
+    field_map = {
+        "problem": "problem",
+        "mevcut_durum": "mevcut_durum",
+        "fikrin_ozeti": "fikrin_ozeti",
+        "fikrin_aciklamasi": "fikrin_aciklamasi",
+        "cozum_tipi": "cozum_tipi",
+        "hedef_kitle": "hedef_kitle",
+        "kpi": "kpi",
     }
+    field_name = field_map.get(step)
+    if not field_name:
+        return []
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_text_field",
+                "description": f"{field_name} alanını doldurur/günceller.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                    },
+                    "required": ["value"],
+                },
+            },
+        }
+    ]
 
 
+def _build_step_system_prompt(current_step: str, fields: Dict[str, Any]) -> str:
+    step_prompt = STEP_PROMPTS.get(current_step, STEP_PROMPTS[STEP_ORDER[0]])
+    fields_summary = _summarize_fields(fields)
+    return f"""
+Mevcut toplanan alanlar:
+{fields_summary}
+
+Şu anki adım: {current_step}
+Görev: {step_prompt}
+
+Kurallar:
+- Kullanıcıya sadece 1 soru sor.
+- Cevap muğlak/eksikse netleştirici soru sor.
+- Kısa cevap verme; 3-4 cümleyle açıklayıcı ol, 1-2 örnek ekle.
+- Kullanıcı 'vazgeçtim' vb. derse süreci kibarca kapat.
+
+Tool Kullanımı:
+- Bu adımın alanını doldurabiliyorsan, mutlaka ilgili tool'u çağır.
+- Tool argümanlarında sadece ilgili alanı gönder.
+- Kullanıcıya göstereceğin mesajı normal içerik (content) olarak yaz.
+"""
 mcp = FastMCP("flow-analyst-server")
-
-
-@mcp.tool(name="flow_analyst", description="Analist asistanı ile fikir toplama akışını çalıştırır.")
-async def flow_analyst(
-    question: str,
-    thread_id: Optional[str] = None,
-    chat_history: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """
-    fastmcp tool wrapper: flow_analyst.
-
-    MCP istemcileri bu tool'u çağırdığında:
-    - Parametreleri alır,
-    - flow_analyst_core'u çalıştırır,
-    - Sonucu doğrudan tool çıktısı olarak döner.
-    """
-    return flow_analyst_core(
-        question=question,
-        thread_id=thread_id,
-        chat_history=chat_history or [],
-    )
 
 
 @mcp.tool(
@@ -261,6 +414,131 @@ async def submit_idea_form(
         "hedef_kitle": hedef_kitle,
         "kpi": kpi,
     }
+
+def flow_analyst_step_core(
+    question: str,
+    thread_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Step-based core iş mantığı (CLI ve MCP ortak).
+
+    Memory-cache yaklaşımı:
+    - thread_id yoksa yeni üretir ve state oluşturur.
+    - thread_id varsa cache'den state yükler.
+    - current_step'e göre LLM'e kısa prompt + state özeti gönderir.
+    - JSON çıktı ile fields merge edilir, step ilerletilir, history güncellenir.
+    """
+    tid = thread_id or str(uuid.uuid4())
+    state = _STATE_CACHE.get(tid) or _new_state()
+
+    current_step = state.get("current_step") or STEP_ORDER[0]
+    fields = state.get("fields") or {}
+    history: List[Dict[str, str]] = state.get("history") or []
+
+    msgs: List[Dict[str, str]] = []
+    # kısa history (son 6 mesaj)
+    if history:
+        msgs.extend(history[-6:])
+    msgs.append({"role": "user", "content": question})
+
+    # Step-based akışta sistem promptu SADECE ilgili adım promptudur
+    system_prompt = _build_step_system_prompt(current_step=current_step, fields=fields)
+    tools = _tools_for_step(current_step)
+
+    assistant_message = ""
+    extracted: Dict[str, Any] = {}
+    is_confirmed = False
+
+    if tools:
+        llm_raw = _call_llm_tools(system_prompt, msgs, tools)
+        assistant_message, tool_calls = _extract_assistant_message_and_tool_calls(llm_raw)
+
+        for tc in tool_calls:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            name = fn.get("name")
+            args = _safe_json_loads(fn.get("arguments"))
+
+            if name == "set_text_field":
+                val = (args.get("value") or "").strip() if isinstance(args, dict) else ""
+                if val:
+                    extracted[current_step] = val
+
+            elif name == "set_kanallar":
+                chans = args.get("kanallar") if isinstance(args, dict) else None
+                if isinstance(chans, list):
+                    extracted["kanallar"] = [c for c in chans if isinstance(c, str) and c.strip()]
+
+            elif name == "set_amac":
+                amac_val = args.get("amac") if isinstance(args, dict) else None
+                if isinstance(amac_val, str) and amac_val.strip():
+                    extracted["amac"] = amac_val.strip()
+
+            elif name == "confirm_form":
+                is_confirmed = bool(args.get("is_confirmed")) if isinstance(args, dict) else False
+
+        # Tool call gelmediyse fallback: JSON-mode ile dene
+        if not extracted and not is_confirmed and not assistant_message:
+            result = _call_llm_json(system_prompt, msgs)
+            assistant_message = (result.get("assistant_message") or "").strip()
+            extracted = result.get("extracted") or {}
+            is_confirmed = bool(result.get("is_confirmed"))
+    else:
+        # Safety fallback (normalde STEP_ORDER hepsi tool'a sahip)
+        result = _call_llm_json(system_prompt, msgs)
+        assistant_message = (result.get("assistant_message") or "").strip()
+        extracted = result.get("extracted") or {}
+        is_confirmed = bool(result.get("is_confirmed"))
+
+    _merge_extracted(fields, extracted)
+
+    # step ilerletme
+    if is_confirmed:
+        state["is_confirmed"] = True
+        state["current_step"] = "done"
+    else:
+        # Alan dolduysa sıradaki step'e geç; dolmadıysa aynı step'te kal
+        field_is_filled = False
+        if current_step == "kanallar":
+            field_is_filled = bool(fields.get("kanallar"))
+        elif current_step == "confirm":
+            field_is_filled = False
+        else:
+            v = fields.get(current_step)
+            field_is_filled = bool(v) and (not isinstance(v, str) or bool(v.strip()))
+
+        state["current_step"] = _next_step_name(current_step) if field_is_filled else current_step
+
+    # history güncelle (user+assistant)
+    if question:
+        history.append({"role": "user", "content": question})
+    if assistant_message:
+        history.append({"role": "assistant", "content": assistant_message})
+    state["history"] = history[-20:]
+    state["fields"] = fields
+
+    _STATE_CACHE[tid] = state
+
+    return {
+        "answer": assistant_message,
+        "thread_id": tid,
+        "current_step": state.get("current_step"),
+        "is_confirmed": state.get("is_confirmed", False),
+        "fields": state.get("fields"),
+    }
+
+
+@mcp.tool(
+    name="flow_analyst_step",
+    description=(
+        "Step-based analist akışı. Thread bazlı memory cache ile state tutar; "
+        "her çağrıda sadece ilgili alanın kısa promptunu kullanır ve JSON çıktıyla state'i günceller."
+    ),
+)
+async def flow_analyst_step(
+    question: str,
+    thread_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return flow_analyst_step_core(question=question, thread_id=thread_id)
 
 
 if __name__ == "__main__":
